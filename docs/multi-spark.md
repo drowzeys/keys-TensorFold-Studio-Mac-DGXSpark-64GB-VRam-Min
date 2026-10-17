@@ -4,7 +4,8 @@ A job in the Studio can use more than one DGX Spark. You choose a number from 1 
 the job may use, the one the app runs on counted as one. The app shows how many are there and able, uses that many,
 and says what the number will do before you queue anything.
 
-On a Mac the setting shows 1: multi-Spark rendering is for DGX Sparks.
+On a Mac the setting shows 1: multi-Spark rendering is run from a DGX Spark. A Mac can be one of its workers
+(*A Mac as a worker* below).
 
 ## What you need
 
@@ -33,6 +34,34 @@ memory back. **Remove** takes it off the list. Untick **use** to keep a Spark in
 A worker's app is never opened to the network. This app reaches it through an ssh tunnel that it opens itself and
 closes when you remove the worker or stop the app. The list is kept in `sparks/sparks.json` in the studio folder
 (`~/TensorFoldStudio`), not in the code.
+
+## A Mac as a worker
+
+A Mac with the Studio installed (`bash oneshot-setup.sh`, FastH3 included) can stand in the list beside the Sparks:
+add it the same way, by its ssh address (`user@mac-studio`), with a key login from this Spark to that user. The head
+stays a Spark; the Mac takes single clips from the same queue.
+
+- **What it is given:** what any worker is given when it has what the job needs: FastH3 clips, from text or from a
+  first and last frame, at the sizes and passes a Spark offers, with a LoRA when that LoRA is installed on the Mac;
+  pictures (a scout) and clips from a new picture, on its image model. It renders them on its own engine (the native Zig engine
+  on an M5, MLX elsewhere, with the 8-bit weights on a chip without tensor units), so a clip takes the Mac's time,
+  not a Spark's, and the same seed does not give the same frames as on a Spark. Measured on an M3 Ultra (MLX, 8-bit
+  weights, no tensor units): a 5 s 864x480 clip at 8 passes took 643 s (70.7 s a pass), against 73 s on a Spark,
+  about 9 times. With N clips and a Mac in the team the Mac's one clip is the last to finish whenever N is under
+  about twice that ratio. For such a worker set `batch`: it is then given a clip only when at least that many clips
+  are waiting, and pictures whenever it is free, so short, urgent batches stay on the Sparks and long ones use it as
+  overflow (`curl -X POST .../api/sparks/workers/<address> -d '{"batch": 20}'`; `0` gives it any clip again). The plan
+  says *kept for long batches* beside it while a batch is shorter. Its row shows the number.
+- **What it is not given:** what it has not installed (Ref2VA, a LoRA), and a text encoder chosen by its file name
+  (a Spark names a file in ComfyUI's folder, a Mac takes a path). Long videos, edits and Library actions stay on
+  this Spark, as for any worker. The plan under the chooser says, Mac by Mac, why one is left out.
+- **Memory:** a Mac has no memory guard to ask (its memory is not shared with a CUDA driver); it is not held to one.
+- **Its row** says *Mac · MLX engine* (or *native Zig engine*) beside its name. With a Mac in the team the time
+  estimate says it is not measured: the measured run below is five Sparks.
+- **Start and stop:** *Update and start* sends the code, starts the Mac's app with `nohup` on its own `127.0.0.1:7870`
+  (there is no `setsid` on macOS) and waits for it in the same ssh call; *Stop* stops the app (there is no ComfyUI
+  server on a Mac). Every command runs under `bash` whatever the login shell there is. An app the Mac's own launcher
+  started is not one the head started: stop it on the Mac first, as on a Spark.
 
 ## Choose the number
 
@@ -68,7 +97,8 @@ A job queued without `sparks` takes the number set on the Sparks tab. `GET /api/
 | A segment or shot that opens on the last frame of the one before | It waits for that one, then renders on any free Spark. A board that is one chain renders one clip at a time. |
 | A long video (over 15 s) | One Spark, this one: it is a chain, each piece opens on the last frame of the one before. |
 | A clip with a LoRA, or from references (Ref2VA) | Only on Sparks that have that LoRA, or Ref2VA, installed, and only when that Spark's memory guard accepts the clip. With none: this Spark. |
-| Pictures, edits, Library actions (Turnaround, Upscale, Remove a person), a timeline export, a clip that starts from a new picture | This Spark. |
+| A set of pictures (a scout), a clip that starts from a new picture | Like a clip: one per Spark, on this Spark and the workers that have the image model (and FastH3, for the clip). The pictures and the clip come back to the paths they would have here. |
+| Edits, Library actions (Turnaround, Upscale, Remove a person), a timeline export | This Spark. |
 
 A clip rendered on a worker comes back into this Spark's studio folder at the path it would have had here (the
 Library, a project's segment, a Slate take), and the QA gate, the shot check and the silenced sound track run here,
@@ -130,7 +160,8 @@ measured run lost at four. It is an estimate. Six to eight Sparks are not measur
   a rank, and so five on one clip, was never run. Until then one clip renders on one Spark and the page says so.
 - **A long video's pieces side by side.** The pieces are a chain. Rendering them at once needs keyframes between
   the pieces, which is another way of making a long video and is not built.
-- **Pictures and Library actions on a worker.** Only single clips are handed over.
+- **Edits and Library actions on a worker.** Clips and pictures are handed over; an edit or an action reads pictures by
+  paths of this studio folder that are not sent.
 - **The queue across a restart.** Jobs are kept in memory: if this app stops while a worker renders, the worker
   finishes its clip in its own folder and this app, started again, does not fetch it.
 - **Starting a worker's install.** The app sends code, not models or the environment.

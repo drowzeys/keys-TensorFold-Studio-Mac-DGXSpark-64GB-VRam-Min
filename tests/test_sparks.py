@@ -82,8 +82,15 @@ class Worker:
                         if outer.fails:
                             job.update(status="failed", error="ComfyUI stopped: the memory floor")
                             return
-                        outer.files[f"renders/{job['id']}.mp4"] = f"made on {outer.name}".encode()
-                        job.update(status="done", outputs=[f"renders/{job['id']}.mp4"])
+                        made = f"made on {outer.name}".encode()
+                        if job["kind"] == "scout":  # its pictures, named by their seeds, and the sheet
+                            seed, count = int(job["params"].get("seed", 0)), int(job["params"].get("count", 4))
+                            outputs = [f"scouts/{job['id']}/scout_s{seed + n}.png" for n in range(count)] + [f"scouts/{job['id']}/sheet.jpg"]
+                        else:  # a clip, and for a clip from a new picture the picture beside it
+                            outputs = [f"renders/{job['id']}.mp4"] + ([f"renders/{job['id']}.png"] if job["kind"] == "studio" else [])
+                        for path in outputs:
+                            outer.files[path] = made
+                        job.update(status="done", outputs=outputs)
 
                     threading.Thread(target=finish, daemon=True).start()
                     return self.answer(job)
@@ -108,7 +115,7 @@ class Worker:
 
         self.http = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.base = f"http://127.0.0.1:{self.http.server_address[1]}"
-        self.address = f"10.9.9.{self.http.server_address[1] % 250 + 1}"
+        self.address = f"10.9.{self.http.server_address[1] // 256}.{self.http.server_address[1] % 256}"  # one per port: never two alike
         threading.Thread(target=self.http.serve_forever, daemon=True).start()
 
 
@@ -151,7 +158,15 @@ def local_render(job, command, env, label=""):
         time.sleep(TAKES)
         if job["status"] == "cancelled":
             return False
+        if job["kind"] == "scout":  # scout.sh prompt count folder: the pictures and the sheet
+            folder, seed = Path(command[-1]), int(env.get("SEED", 0))
+            folder.mkdir(parents=True, exist_ok=True)
+            for path in [folder / f"scout_s{seed + n}.png" for n in range(int(command[-2]))] + [folder / "sheet.jpg"]:
+                path.write_bytes(b"made here")
+            return True
         Path(command[-1]).write_bytes(b"made here")
+        if job["kind"] == "studio":
+            Path(command[-1]).with_suffix(".png").write_bytes(b"made here")
         return True
     finally:
         local_render.now -= 1
@@ -237,10 +252,29 @@ def test_what_a_worker_can_render_decides_what_it_is_given():
     assert "ffmpeg" in sparks.capable("video", {"references": ["uploads/a.png"], "reference_videos": ["uploads/m.mp4"]}, {**plain, "ref2va": True})
     assert "text encoder" in sparks.capable("video", {"text_encoder": "other.safetensors"}, plain)
     assert sparks.capable("video", {"text_encoder": "other.safetensors"}, {**plain, "text_encoders": ["other.safetensors"]}) == ""
-    assert "FastH3" in sparks.capable("video", {}, {}) and "only single clips" in sparks.capable("scout", {}, plain)
+    assert "FastH3" in sparks.capable("video", {}, {}) and "only single clips and pictures" in sparks.capable("edit", {}, plain)
+    # pictures need the image model there; a clip from a new picture needs it and FastH3
+    assert "image model" in sparks.capable("scout", {}, plain) and sparks.capable("scout", {}, {"image": True}) == ""
+    # a FLUX3-K picture goes only to a worker that says it has that model (a 2.7 worker says nothing: Qwen only)
+    assert "flux3k-fast is not installed" in sparks.capable("scout", {"image_model": "flux3k-fast"}, {"image": True})
+    assert "flux3k-full is not installed" in sparks.capable("studio", {"image_model": "flux3k-full"}, {"image": True, "fasth3": True, "image_models": ["qwen", "flux3k-fast"]})
+    assert sparks.capable("scout", {"image_model": "flux3k-fast"}, {"image": True, "image_models": ["qwen", "flux3k-fast"]}) == ""
+    assert sparks.capable("scout", {"image_model": "qwen"}, {"image": True}) == ""
+    assert "image model" in sparks.capable("studio", {}, plain) and "FastH3" in sparks.capable("studio", {}, {"image": True})
+    assert sparks.capable("studio", {}, {**plain, "image": True}) == ""
     # what stays on this Spark whatever the number, and why
-    assert "chain" in sparks.here_only("long", {}) and "picture model" in sparks.here_only("studio", {}) and sparks.here_only("video", {}) == ""
-    assert "this Spark" in sparks.here_only("edit", {})
+    assert "chain" in sparks.here_only("long", {}) and sparks.here_only("studio", {}) == "" and sparks.here_only("scout", {}) == ""
+    assert sparks.here_only("video", {}) == "" and "this Spark" in sparks.here_only("edit", {})
+    # what a worker made, matched to where it goes here
+    here = [Path("scouts/j/scout_s5.png"), Path("scouts/j/scout_s6.png"), Path("scouts/j/sheet.jpg")]
+    assert sparks.pairs(["scouts/t/scout_s5.png", "scouts/t/scout_s6.png", "scouts/t/sheet.jpg"], here)[2] == ("scouts/t/sheet.jpg", here[2])
+    assert sparks.pairs(["scouts/t/scout_s5.png", "scouts/t/sheet.jpg"], here) == [("scouts/t/scout_s5.png", here[0]), ("scouts/t/sheet.jpg", here[2])]
+    for theirs in ([], ["scouts/t/scout_s6.png"]):
+        try:
+            sparks.pairs(theirs, here)
+            raise AssertionError(theirs)
+        except LookupError:
+            pass
 
 
 def test_the_time_at_a_number_follows_the_rounds_the_clips_go_in():
@@ -519,6 +553,127 @@ def test_a_mac_shows_one_and_says_why():
     assert not mac.started  # no loop, no ssh, on a Mac
 
 
+def test_a_mac_worker_takes_the_clips_it_can_render():
+    """A Mac with the Studio installed: no memory guard to bring, its own engine, the same single clips when it has
+    what they need."""
+
+    spark, mac = Worker("spark-a"), Worker("mac-studio", platform="mac", engine="MLX engine", guard=False, memory={})
+    fresh(spark, mac)
+    seen = client.get("/api/sparks").json()
+    row = next(row for row in seen["workers"] if row["name"] == "mac-studio")
+    assert row["state"] == "ready" and row["usable"] and row["platform"] == "mac" and row["engine"] == "MLX engine" and not row["guard"]
+    assert seen["available"] == 3 and seen["this"]["platform"] in ("spark", "mac")
+    # what it cannot render is said, worker by worker; a Spark's text encoder file is not a Mac's setting
+    refs = client.post("/api/sparks/plan", json={"sparks": 3, "kind": "video", "clips": 2, "params": {"references": ["uploads/face.png"]}}).json()
+    assert [w["name"] for w in refs["without"]] == ["spark-a", "mac-studio"] and "Ref2VA" in refs["without"][1]["why"]
+    spark.has["text_encoders"] = mac.has["text_encoders"] = ["other.safetensors"]
+    hub.act(spark.address, "check"), hub.act(mac.address, "check")
+    settle()
+    encoder = client.post("/api/sparks/plan", json={"sparks": 3, "kind": "video", "clips": 2, "params": {"text_encoder": "other.safetensors"}}).json()
+    assert [w["name"] for w in encoder["without"]] == ["mac-studio"] and "Mac" in encoder["without"][0]["why"]
+    assert "Mac" in sparks.capable("video", {"text_encoder": "x.safetensors"}, {"fasth3": True, "platform": "mac", "text_encoders": ["x.safetensors"]})
+    # the measured speedup is a run on Sparks: with a Mac in the team the estimate says it is not measured
+    said = client.post("/api/sparks/plan", json={"sparks": 3, "kind": "video", "clips": 6, "seconds": 40}).json()
+    assert said["used"] == 3 and said["estimate"]["measured"] is False and "mac-studio is a Mac" in said["estimate"]["note"]
+    assert client.post("/api/sparks/plan", json={"sparks": 2, "kind": "video", "clips": 6, "seconds": 40}).json()["estimate"]["measured"] is True
+    # plain clips go to it as to a Spark and come back here
+    done = finished([queue(3, seed=40 + n)["id"] for n in range(6)])
+    assert all(job["status"] == "done" for job in done) and "mac-studio" in {job["spark"] for job in done}
+    clip = next(job for job in done if job["spark"] == "mac-studio")
+    assert (server.HOME / clip["outputs"][0]).read_bytes() == b"made on mac-studio" and mac.most == 1
+    # a clip it cannot render never reaches it: here, a Mac without FastH3
+    mac.has["fasth3"] = False
+    hub.act(mac.address, "check")
+    settle()
+    before = len(mac.jobs)
+    done = finished([queue(3, seed=50 + n)["id"] for n in range(4)])
+    assert len(mac.jobs) == before and "mac-studio" not in {job["spark"] for job in done}
+
+
+def test_pictures_and_a_clip_from_a_new_picture_go_to_a_worker_with_the_image_model():
+    spark, mac = Worker("spark-a"), Worker("mac-studio", platform="mac", engine="MLX engine", guard=False, memory={}, image=True)
+    fresh(spark, mac)
+    body = lambda seed: {"kind": "scout", "sparks": 3, "title": "scout", "params": {"prompt": "a lot at dusk", "count": 2, "preset": "small", "seed": seed}}
+    ids = [client.post("/api/jobs", json=body(10 * n)).json()["id"] for n in range(4)]
+    done = finished(ids)
+    assert all(job["status"] == "done" for job in done), [(job["status"], job["error"]) for job in done]
+    assert {job["spark"] for job in done} <= {hub.name, "mac-studio"} and "mac-studio" in {job["spark"] for job in done}
+    assert not any(job["kind"] == "scout" for job in spark.jobs.values())  # no image model there
+    there = next(job for job in done if job["spark"] == "mac-studio")
+    seed = there["params"]["seed"]
+    assert there["outputs"] == [f"scouts/{there['id']}/scout_s{seed}.png", f"scouts/{there['id']}/scout_s{seed + 1}.png", f"scouts/{there['id']}/sheet.jpg"]
+    assert all((server.HOME / path).read_bytes() == b"made on mac-studio" for path in there["outputs"])
+    # a clip from a new picture: the clip and its picture come back to their paths here
+    studio = {"kind": "studio", "sparks": 3, "title": "studio", "params": {"prompt": "a walk", "image_prompt": "a lot at dusk", "preset": PRESET,
+                                                                           "quality": QUALITY, "frames": 22, "shot_check": False}}
+    done = finished([client.post("/api/jobs", json={**studio, "params": {**studio["params"], "seed": n}}).json()["id"] for n in range(4)])
+    assert all(job["status"] == "done" for job in done), [(job["status"], job["error"]) for job in done]
+    there = next(job for job in done if job["spark"] == "mac-studio")
+    assert there["outputs"] == [f"renders/{there['id']}.mp4", f"renders/{there['id']}.png"]
+    assert all((server.HOME / path).read_bytes() == b"made on mac-studio" for path in there["outputs"])
+    asked = next(job for job in mac.jobs.values() if job["kind"] == "studio")["params"]
+    assert asked["image_prompt"] == "a lot at dusk" and asked["shot_check"] is False and "output" not in asked
+
+
+def test_a_worker_kept_for_long_batches_takes_clips_only_from_one():
+    """``batch``: a slow worker (a Mac) is given a clip only when that many are waiting; pictures whenever it is free."""
+
+    spark, mac = Worker("spark-a"), Worker("mac-studio", platform="mac", engine="MLX engine", guard=False, memory={}, image=True)
+    fresh(spark, mac)
+    assert client.post(f"/api/sparks/workers/{mac.address}", json={"batch": "many"}).status_code == 400
+    row = next(r for r in client.post(f"/api/sparks/workers/{mac.address}", json={"batch": 6}).json()["workers"] if r["name"] == "mac-studio")
+    assert row["batch"] == 6
+    said = client.post("/api/sparks/plan", json={"sparks": 3, "kind": "video", "clips": 3}).json()
+    assert said["used"] == 2 and "kept for long batches" in said["without"][0]["why"] and said["without"][0]["name"] == "mac-studio"
+    assert client.post("/api/sparks/plan", json={"sparks": 3, "kind": "video", "clips": 12}).json()["used"] == 3
+    pictures = client.post("/api/sparks/plan", json={"sparks": 3, "kind": "scout", "clips": 1}).json()
+    assert pictures["used"] == 2 and [w["name"] for w in pictures["without"]] == ["spark-a"]  # the Mac is free for pictures; spark-a has no image model
+    # a short batch of clips: the Sparks only
+    done = finished([queue(3, seed=60 + n)["id"] for n in range(3)])
+    assert "mac-studio" not in {job["spark"] for job in done} and not mac.jobs
+    # a long one: the Mac takes clips too
+    done = finished([queue(3, seed=70 + n)["id"] for n in range(12)])
+    assert "mac-studio" in {job["spark"] for job in done}
+    # pictures: whenever it is free
+    body = lambda seed: {"kind": "scout", "sparks": 3, "title": "scout", "params": {"prompt": "a lot at dusk", "count": 1, "preset": "small", "seed": seed}}
+    finished([client.post("/api/jobs", json=body(n)).json()["id"] for n in range(3)])
+    assert any(job["kind"] == "scout" for job in mac.jobs.values())
+    # unset again: any clip
+    assert next(r for r in client.post(f"/api/sparks/workers/{mac.address}", json={"batch": 0}).json()["workers"] if r["name"] == "mac-studio")["batch"] is None
+
+
+def test_the_commands_on_a_worker_run_in_bash_on_linux_and_macos():
+    """What ssh runs on a worker: bash whatever the login shell (zsh on a Mac), and nothing that only Linux has."""
+
+    seen = []
+    had = sparks.subprocess.run
+    sparks.subprocess.run = lambda command, **kwargs: seen.append(command) or subprocess.CompletedProcess(command, 0, "", "")
+    try:
+        sparks.shell("user@mac", 'echo "$HOME"; (exec 3<>/dev/tcp/127.0.0.1/7870) && echo yes')
+    finally:
+        sparks.subprocess.run = had
+    assert seen[0][-2] == "user@mac" and seen[0][-1] == """bash -c 'echo "$HOME"; (exec 3<>/dev/tcp/127.0.0.1/7870) && echo yes'"""
+    start, stop, up = sparks.Hub.start_command("keys-studio"), sparks.Hub.stop_command("keys-studio"), sparks.Hub.up_command()
+    assert "$(command -v setsid) bash scripts/app.sh" in start and "HOST=127.0.0.1" in start and "nohup" in start
+    assert "/proc/" not in stop and 'ps -o command= -p "$(cat "$H/app.pid")"' in stop and '[ "$(uname -s)" = Linux ]' in stop
+    assert "/dev/tcp/127.0.0.1/7870" in up and "app up" in up
+    for line in (start, stop, up):  # each runs as it is in bash
+        assert subprocess.run(["bash", "-n", "-c", line], timeout=10).returncode == 0, line
+    # a Mac's probe: no /proc/meminfo, its memory from sysctl
+    one = Worker("mac-b", platform="mac", guard=False, memory={})
+    fresh()
+    WORKERS[one.address] = one
+    had_shell = hub.shell
+    hub.shell = lambda address, command, timeout=30: (SHELLS.append((address, command)) or 0, "host mac-b\nversion 2.7.2\npack yes\ninstall yes\nos Darwin\nMemTotal: 268435456 kB\napp yes")
+    try:
+        found = hub.probe({"address": one.address, "folder": "keys-studio"})
+    finally:
+        hub.shell = had_shell
+    assert found["os"] == "Darwin" and found["MemTotal"] == 262144 and found["app"] == "yes" and "MemAvailable" not in found
+    probe = SHELLS[-1][1]
+    assert "sysctl -n hw.memsize" in probe and "[ -r /proc/meminfo ]" in probe
+
+
 def test_nothing_here_runs_a_tool_without_a_time_limit():
     tree = ast.parse((ROOT / "app/sparks.py").read_text())
     for call in [node for node in ast.walk(tree) if isinstance(node, ast.Call)]:
@@ -542,7 +697,8 @@ vm.runInThisContext(fs.readFileSync(process.argv[2], "utf8"));
 vm.runInThisContext(`(async () => { const out = {};
   const five = { supported: true, limit: 8, available: 5, listed: 5, default: 1, this: { name: "head", state: "ready", version: "2.6.6", memory_gb: 110, disk_gb: 70, can: { fasth3: true, image: true, ref2va: true, ref2va_turbo: true, ffmpeg: true, loras: 22 } },
     workers: [{ address: "10.100.10.5", name: "gx10-5482", state: "ready", says: "idle", enabled: true, usable: true, guard: true, version: "2.6.6", memory_gb: 116.1, disk_gb: 40, can: { fasth3: true, loras: 0 }, why: "", working: "" },
-              { address: "10.100.10.3", name: "spark-0060", state: "down", says: "stopped answering", enabled: true, usable: false, unusable: "it stopped answering", why: "It stopped answering for 60 s while rendering", working: "", version: "2.6.6" }] };
+              { address: "10.100.10.3", name: "spark-0060", state: "down", says: "stopped answering", enabled: true, usable: false, unusable: "it stopped answering", why: "It stopped answering for 60 s while rendering", working: "", version: "2.6.6" },
+              { address: "user@mac-studio", name: "mac-studio", state: "ready", says: "idle", enabled: true, usable: true, guard: false, platform: "mac", engine: "MLX engine", version: "2.6.6", disk_gb: 60, can: { fasth3: true, image: true, loras: 0 }, why: "", working: "" }] };
   out.counts = [spkCount(five, 1), spkCount(five, 5), spkCount(five, 8), spkCount({ supported: false }, 1)];
   answers["/api/sparks"] = five; answers["/api/sparks/plan"] = { supported: true, count: "5 of 8 available", says: "One clip per Spark, 5 at a time: 8 clips on 5 Sparks.", mode: "parallel", without: [{ name: "spark-0060", why: "it stopped answering" }], estimate: { seconds: 80, one_spark: 320, faster: 4, note: "an estimate" } };
   await spkLoad(); spkSet(8);
@@ -569,7 +725,7 @@ def test_the_page_draws_the_chooser_and_the_list():
     assert out["buttons"] == list("12345678") and out["on"] == ["8"] and out["far"] == ["6", "7", "8"]
     assert "5 of 8 available" in out["says"] and "One clip per Spark" in out["says"] and "spark-0060 (it stopped answering)" in out["says"] and "Estimate" in out["says"]
     assert out["sent"] == {"sparks": 8, "kind": "video", "params": {}, "clips": 8, "seconds": 0} and out["kept"]
-    for words in ("gx10-5482", "10.100.10.5", "116.1 GB of memory available", "FastH3 clips", "no LoRAs", "It stopped answering for 60 s", "Update and start", "Add a Spark", "5 available"):
+    for words in ("gx10-5482", "10.100.10.5", "116.1 GB of memory available", "FastH3 clips", "no LoRAs", "It stopped answering for 60 s", "Update and start", "Add a Spark", "5 available", "Mac · MLX engine"):
         assert words in out["page"], words
     assert out["mac"][0] == 1 and out["mac"][1] == ["1"] and "DGX Sparks" in out["mac"][2]
     # every job the page queues carries the number

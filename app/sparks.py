@@ -15,15 +15,24 @@ What N means:
 - one clip: it renders on one Spark. Splitting one clip across Sparks is measured (docs/multi-spark.md) and is not
   in the app;
 - a long video is a chain (each piece opens on the last frame of the one before): one Spark, this one;
-- pictures, edits, Library actions and exports: this Spark.
+- a set of pictures (a scout) and a clip from a new picture (studio) go to a worker that has the image model, like a clip;
+- edits, Library actions and exports: this Spark.
 
 A worker that stops answering while it renders is marked down and its clip goes back to the queue for another
 machine; a worker is never waited on for more than LOST seconds. One job runs on a Spark at a time.
 
 Kept in the studio folder, under sparks/:
-  sparks.json    {"workers": [{"address", "name", "folder", "enabled"}], "sparks": the number new jobs start with}
+  sparks.json    {"workers": [{"address", "name", "folder", "enabled", "batch"}], "sparks": the number new jobs start with}
+                 batch: a worker for long batches only (a slow one, a Mac): it is given a clip only when at least this
+                 many clips are waiting in the queue; pictures go to it whenever it is free. Unset: any clip.
   takes.jsonl    one line per finished clip: its path, seed, settings and the Spark that rendered it
   tunnels.json   the tunnels this app has open (closed by the next start if this one was killed)
+
+A worker may also be a Mac (Apple silicon, its Studio installed with oneshot-setup.sh). It says so on /api/spark/self
+("platform": "mac", "engine": the MLX or native engine) and is handed the same jobs as a Spark worker (FastH3 clips
+from text or a first and last frame, pictures, a clip from a new picture) when it has what the job needs; what only a Spark's install names the same way (a text encoder
+chosen by its file) stays on the Sparks. A Mac has no memory guard to ask: its memory is not shared with a CUDA
+driver. The commands run on a worker over ssh are written for bash on Linux and on macOS (no setsid, no /proc there).
 """
 
 from __future__ import annotations
@@ -34,6 +43,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -56,7 +66,7 @@ LOST = float(os.environ.get("STUDIO_SPARK_LOST", "60"))    # a worker silent thi
 CALL = float(os.environ.get("STUDIO_SPARK_CALL", "10"))    # the longest one request to a worker may take
 MOVES = 2        # a clip is taken back from a worker at most this often; after that it renders on this Spark
 DISK_GB = 2      # a worker with less free disk than this is not given a clip
-KINDS = ("video",)  # what is handed to a worker: single clips
+KINDS = ("video", "scout", "studio")  # what is handed to a worker: single clips, a set of pictures, a clip from a new picture
 PREFIX = "$HOME/.local/opt/tensorfold-studio"
 THEIR_HOME = "$HOME/TensorFoldStudio"  # a worker's studio folder, and where its app's pid and log are kept
 ADDRESS = re.compile(r"(?:[a-z_][a-z0-9_-]{0,31}@)?[A-Za-z0-9][A-Za-z0-9.-]{0,252}")
@@ -75,6 +85,8 @@ STATES = {"new": "not checked yet", "unreachable": "does not answer over ssh", "
           "stopped": "its Studio app is not running", "update": "its Studio code differs from this Spark's",
           "ready": "idle", "busy": "rendering", "down": "stopped answering"}
 MAC = "Multi-Spark rendering is for DGX Sparks: on a Mac every job renders on this machine."
+# what a worker's platform is called; a worker that does not say is a Spark
+PLATFORMS = {"spark": "DGX Spark", "mac": "Mac"}
 ONE_CLIP = ("Splitting a single clip across Sparks is measured (1.40x on 2, 1.73x on 3, 1.77x on 4 for a 5 s 864x480 clip) "
             "and is not in the app yet.")
 
@@ -169,7 +181,9 @@ def shell(address: str, command: str, timeout: float = 30) -> tuple[int, str]:
     when ssh itself cannot reach it or log in."""
 
     try:
-        done = subprocess.run([*SSH, address, command], capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        # run by bash whatever the login shell there is (zsh on a Mac has no /dev/tcp): ssh hands the line to that shell
+        done = subprocess.run([*SSH, address, "bash -c " + shlex.quote(command)], capture_output=True, text=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return 255, f"no answer over ssh in {timeout:g} s"
     except OSError as error:
@@ -235,7 +249,15 @@ def capable(kind: str, params: dict, info: dict | None) -> str:
 
     info = info or {}
     if kind not in KINDS:
-        return "only single clips are handed to another Spark"
+        return "only single clips and pictures are handed to another Spark"
+    if kind in ("scout", "studio") and not info.get("image"):
+        return "the image model (Qwen-Image-2.1) is not installed there"
+    model = str(params.get("image_model") or "qwen")
+    if kind in ("scout", "studio") and model != "qwen" and model not in (info.get("image_models") or []):
+        # a worker on 2.7 says nothing of its picture models: it has Qwen only
+        return f"the picture model {model} is not installed there"
+    if kind == "scout":
+        return ""
     if not info.get("fasth3"):
         return "FastH3 is not installed there"
     media = bool(params.get("reference_videos") or params.get("reference_audios"))
@@ -250,9 +272,18 @@ def capable(kind: str, params: dict, info: dict | None) -> str:
     if missing:
         return "the LoRA " + ", ".join(missing) + " is not installed there"
     encoder = params.get("text_encoder")
-    if encoder not in (None, "", "regular") and Path(str(encoder)).name not in (info.get("text_encoders") or []):
-        return "the text encoder file is not on that Spark"
+    if encoder not in (None, "", "regular"):
+        if platform_of(info) != "spark":  # a Spark names the file in ComfyUI's folder, a Mac takes a path: not the same setting
+            return "a text encoder chosen by its file is a Spark's setting; this worker is a " + PLATFORMS.get(platform_of(info), platform_of(info))
+        if Path(str(encoder)).name not in (info.get("text_encoders") or []):
+            return "the text encoder file is not on that Spark"
     return ""
+
+
+def platform_of(info: dict | None) -> str:
+    """What a worker runs on, from its /api/spark/self: "spark" or "mac"."""
+
+    return str((info or {}).get("platform") or "spark")
 
 
 def here_only(kind: str, params: dict) -> str:
@@ -260,11 +291,25 @@ def here_only(kind: str, params: dict) -> str:
 
     if kind == "long":
         return "A long video is a chain: each piece opens on the last frame of the one before, so its pieces render one after another, on this Spark."
-    if kind == "studio":
-        return "A clip that starts from a new picture renders on this Spark: the picture model is here."
     if kind not in KINDS:
-        return "Pictures, edits, Library actions and exports render on this Spark: only clips are handed to other Sparks."
+        return "Edits, Library actions and exports render on this Spark: only clips and pictures are handed to other Sparks."
     return ""
+
+
+def pairs(theirs: list[str], targets: list[Path]) -> list[tuple[str, Path]]:
+    """What a worker made (paths in its folder) matched to where each goes here: one for one in the order the job
+    builds them, or by file name when the worker kept fewer (a picture of a scout that failed). LookupError when the
+    first output, the clip or the first picture, is not among them."""
+
+    if not theirs or not targets:
+        raise LookupError("its job finished without an output")
+    if len(theirs) == len(targets):
+        return list(zip(theirs, targets))
+    names = {Path(path).name: path for path in theirs}
+    found = [(names[target.name], target) for target in targets if target.name in names]
+    if not found or found[0][1] != targets[0]:
+        raise LookupError("its job finished without " + targets[0].name)
+    return found
 
 
 def speedup(used: int, clips: int) -> tuple[float, bool]:
@@ -353,12 +398,12 @@ class Hub:
         info, why = live["info"] or {}, self.usable(worker)
         memory = info.get("memory") or {}
         return {"address": worker["address"], "name": worker.get("name") or worker["address"], "folder": worker.get("folder"),
-                "enabled": worker.get("enabled", True), "state": live["state"], "says": STATES.get(live["state"], live["state"]),
+                "enabled": worker.get("enabled", True), "batch": worker.get("batch"), "state": live["state"], "says": STATES.get(live["state"], live["state"]),
                 "why": live["why"], "usable": not why, "unusable": why, "working": live["working"], "checked": live["checked"],
                 "job": live["job"], "version": info.get("version") or live.get("version"),
                 "memory_gb": round(memory["available_mb"] / 1000, 1) if memory.get("available_mb") is not None else live.get("memory_gb"),
                 "disk_gb": info.get("disk_gb"),
-                "guard": bool(info.get("guard")),
+                "guard": bool(info.get("guard")), "platform": platform_of(info) if info else None, "engine": info.get("engine"),
                 "can": {key: bool(info.get(key)) for key in ("fasth3", "image", "ref2va", "ref2va_turbo", "ffmpeg")} | {"loras": len(info.get("loras") or [])} if info else None}
 
     def overview(self) -> dict:
@@ -372,6 +417,7 @@ class Hub:
         return {"supported": True, "limit": LIMIT, "note": "", "available": 1 + sum(1 for row in rows if row["usable"]), "listed": 1 + len(rows),
                 "default": max(1, min(int(found.get("sparks") or 1), LIMIT)), "workers": rows, "folder": self.default_folder(),
                 "this": {"name": self.name, "version": mine.get("version"), "job": local, "state": "busy" if local else "ready",
+                         "platform": platform_of(mine), "engine": mine.get("engine"),
                          "memory_gb": round((mine.get("memory") or {}).get("available_mb", 0) / 1000, 1), "disk_gb": mine.get("disk_gb"),
                          "can": {key: bool(mine.get(key)) for key in ("fasth3", "image", "ref2va", "ref2va_turbo", "ffmpeg")} | {"loras": len(mine.get("loras") or [])}}}
 
@@ -452,14 +498,15 @@ class Hub:
         where = f'"$HOME/{worker.get("folder") or self.default_folder()}"'
         code, said = self.shell(worker["address"], (
             f'F={where}; P="${{PREFIX:-{PREFIX}}}"; H="{THEIR_HOME}"; echo "host $(hostname)"; echo "version $(cat "$F/VERSION" 2>/dev/null)"; '
-            '[ -f "$F/app/server.py" ] && echo "pack yes"; [ -x "$P/venv/bin/python" ] && echo "install yes"; '
-            'grep -E "^(MemTotal|MemAvailable)" /proc/meminfo; '
+            '[ -f "$F/app/server.py" ] && echo "pack yes"; [ -x "$P/venv/bin/python" ] && echo "install yes"; echo "os $(uname -s)"; '
+            'if [ -r /proc/meminfo ]; then grep -E "^(MemTotal|MemAvailable)" /proc/meminfo; '
+            'else echo "MemTotal: $(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1024 )) kB"; fi; '
             f'(exec 3<>/dev/tcp/127.0.0.1/{PORT}) 2>/dev/null && echo "app yes"; '
             '[ -f "$H/app.pid" ] && kill -0 "$(cat "$H/app.pid")" 2>/dev/null && echo "ours yes"; true'), 25)
         found = {"reached": code == 0, "said": said}
         for line in said.splitlines() if code == 0 else []:
             key, _, value = line.partition(" ")
-            if key in ("host", "version", "pack", "install", "app", "ours"):
+            if key in ("host", "version", "pack", "install", "app", "ours", "os"):
                 found[key] = value.strip()
             elif key.rstrip(":") in ("MemTotal", "MemAvailable"):
                 found[key.rstrip(":")] = int(value.split()[0]) // 1024
@@ -483,7 +530,7 @@ class Hub:
             self.hang_up(address)
             set_to("bare", ("No Studio code in " + (worker.get("folder") or self.default_folder()) + " there. " if not found.get("pack") else "")
                    + ("" if found.get("install") else "No Studio environment there (models, ComfyUI, the engine): run oneshot-setup-spark.sh on that Spark once; "
-                      "“Update and start” sends the code, not the models."), info=None)
+                      "on a Mac oneshot-setup.sh; “Update and start” sends the code, not the models."), info=None)
             return live
         if not found.get("app"):
             self.hang_up(address)
@@ -500,7 +547,7 @@ class Hub:
             set_to("down", "Its app does not answer through the tunnel: " + str(error)[-160:], info=None)
             return live
         changed = differs(self.code(), info.get("code"))
-        if changed or not info.get("guard"):
+        if changed or (not info.get("guard") and platform_of(info) == "spark"):  # a Mac has no memory guard to bring
             set_to("update", f"Its Studio code differs from this Spark's in {len(changed)} file{'s' if len(changed) != 1 else ''} ({', '.join(changed[:3])}"
                    + (", …" if len(changed) > 3 else "") + "): “Update and start” brings it level.", info=info)
             return live
@@ -543,31 +590,37 @@ class Hub:
             live.update(state="update", why="The code is there. An app that this Studio did not start is running on that Spark: stop it there, "
                         "then press “Update and start” again.", checked=time.time(), info=None)
             return live
-        code, said = self.shell(address, self.stop_command(folder, comfy=False) + "; " + self.start_command(folder), 40)
+        # the app needs a few seconds to come up: waited for there, in the same ssh call (a Mac's sshd holds a burst of
+        # short logins from one address against it)
+        code, said = self.shell(address, self.stop_command(folder, comfy=False) + "; " + self.start_command(folder) + "; " + self.up_command(), 75)
         if code:
             live.update(state="stopped", why="Its app could not be started: " + said[-200:], checked=time.time(), info=None)
             return live
-        for _ in range(30):  # the app needs a few seconds to come up
-            time.sleep(1)
-            if self.probe(worker).get("app"):
-                break
         return self.check(worker)
 
     @staticmethod
     def start_command(folder: str) -> str:
-        # in a subshell of its own with every stream closed off: ssh returns at once and the app outlives it
+        # in a subshell of its own with every stream closed off: ssh returns at once and the app outlives it (in a session
+        # of its own where there is setsid; macOS has none, and nohup with no terminal is enough there)
         return (f'cd "$HOME/{folder}" && mkdir -p "{THEIR_HOME}" && (STUDIO_PIDFILE="{THEIR_HOME}/app.pid" HOST=127.0.0.1 PORT={PORT} '
-                f'nohup setsid bash scripts/app.sh > "{THEIR_HOME}/app.log" 2>&1 < /dev/null &) && echo started')
+                f'nohup $(command -v setsid) bash scripts/app.sh > "{THEIR_HOME}/app.log" 2>&1 < /dev/null &) && echo started')
+
+    @staticmethod
+    def up_command(wait: int = 30) -> str:
+        """Wait there, up to ``wait`` seconds, for the app to answer on its 127.0.0.1:PORT."""
+
+        return (f'for i in $(seq {wait}); do (exec 3<>/dev/tcp/127.0.0.1/{PORT}) 2>/dev/null && echo "app up" && break; sleep 1; done; true')
 
     @staticmethod
     def stop_command(folder: str, comfy: bool = True) -> str:
         """Stop the app a head started on a worker (by the pid that app wrote down, checked to be a Studio app) and,
         with ``comfy``, the ComfyUI server behind it, which gives the models' memory back."""
 
-        stop = (f'H="{THEIR_HOME}"; if [ -f "$H/app.pid" ] && grep -qa "app/server.py" "/proc/$(cat "$H/app.pid")/cmdline" 2>/dev/null; then '
+        stop = (f'H="{THEIR_HOME}"; if [ -f "$H/app.pid" ] && ps -o command= -p "$(cat "$H/app.pid")" 2>/dev/null | grep -q "app/server.py"; then '
                 'kill "$(cat "$H/app.pid")"; for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$(cat "$H/app.pid")" 2>/dev/null || break; sleep 0.5; done; '
                 'rm -f "$H/app.pid"; echo "app stopped"; else echo "no app of ours"; fi')
-        return stop + (f'; cd "$HOME/{folder}" && bash spark/comfy.sh stop' if comfy else "")
+        # ComfyUI is a Spark's: a Mac renders without it
+        return stop + (f'; if [ "$(uname -s)" = Linux ]; then cd "$HOME/{folder}" && bash spark/comfy.sh stop; fi' if comfy else "")
 
     def stop(self, worker: dict) -> dict:
         """A worker's app (the one a head started) and its ComfyUI server stopped: its memory is free again."""
@@ -616,15 +669,32 @@ class Hub:
         except (TypeError, ValueError):
             return 1
 
+    def overflow(self, worker: dict, kind: str, waiting: int) -> str:
+        """Why a worker kept for long batches is not given this clip now ("" when it may be): it takes clips only when
+        ``batch`` or more are waiting, so a short batch is not held up by its one slow clip."""
+
+        try:
+            batch = int(worker.get("batch") or 0)
+        except (TypeError, ValueError):
+            batch = 0
+        if batch > 1 and kind in ("video", "studio") and waiting < batch:
+            return f"kept for long batches: it takes clips when {batch} or more are waiting ({waiting} now)"
+        return ""
+
+    def waiting(self) -> int:
+        """Clips queued now that may go to another machine."""
+
+        return sum(1 for job in self.jobs.values() if job["status"] == "queued" and job["kind"] in ("video", "studio") and self.asked(job) > 1)
+
     def team(self, job: dict) -> list[str]:
         """The workers a job may render on, in the list's order: the first N - 1 that are up and can render it."""
 
         sparks = job.get("sparks") or {}
         if not self.spark or self.asked(job) < 2 or here_only(job["kind"], job["params"]) or sparks.get("moves", 0) >= MOVES:
             return []
-        found = []
+        found, waiting = [], self.waiting()
         for worker in self.workers():
-            if worker["address"] in (sparks.get("not") or {}) or self.usable(worker):
+            if worker["address"] in (sparks.get("not") or {}) or self.usable(worker) or self.overflow(worker, job["kind"], waiting):
                 continue
             if capable(job["kind"], job["params"], self.state(worker["address"])["info"]):
                 continue
@@ -779,16 +849,17 @@ class Hub:
         theirs.update(qa=False, shot_check=False)  # both run here, on the fetched clip, where their tools are
         return theirs
 
-    def render(self, job: dict, worker: dict, params: dict, target: Path, label: str = "") -> bool:
-        """One take of ``job``'s clip rendered on ``worker`` and fetched to ``target``. False when the job was
-        cancelled meanwhile; Moved when the worker refused the clip, failed it, or stopped answering."""
+    def render(self, job: dict, worker: dict, params: dict, targets: list[Path], label: str = "") -> bool:
+        """One take of ``job`` rendered on ``worker`` and its outputs fetched to ``targets`` (the paths they would have
+        here: a clip, a clip and its picture, a scout's pictures and sheet). False when the job was cancelled meanwhile;
+        Moved when the worker refused the job, failed it, or stopped answering."""
 
         address, name = worker["address"], worker.get("name") or worker["address"]
         say = lambda text: job.update(log=(job["log"] + f"[sparks] {text}\n")[-20000:])
         try:
             base = self.connect(address)
-            # the worker's own memory guard, asked before anything is sent (its app asks it again when the job is queued)
-            room = (call(base, "/api/estimate", {**{key: params.get(key) for key in ("preset", "quality", "frames", "seconds", "width", "height", "steps", "text_encoder", "ref_turbo")},
+            # the worker's own memory guard, asked before a clip is sent (its app asks it again when the job is queued)
+            room = {} if job["kind"] == "scout" else (call(base, "/api/estimate", {**{key: params.get(key) for key in ("preset", "quality", "frames", "seconds", "width", "height", "steps", "text_encoder", "ref_turbo")},
                                                  "with_lora": bool(params.get("loras")), "referenced": bool(params.get("references") or params.get("reference_videos")),
                                                  "references": len(params.get("references") or [])}) or {}).get("memory") or {}
             if room.get("fits") is False:
@@ -801,7 +872,7 @@ class Hub:
             self.move(job, worker, f"it stopped answering before the clip was queued ({str(error)[-120:]})", down=True)
             return False
         job["their_job"] = made["id"]
-        say(f"{name} took the clip as its job {made['id']}" + (f"; its memory guard: about {room['need_mb'] / 1000:.0f} GB needed, {room.get('available_mb', 0) / 1000:.0f} GB there" if room.get("need_mb") else ""))
+        say(f"{name} took the {'clip' if job['kind'] == 'video' else 'job'} as its job {made['id']}" + (f"; its memory guard: about {room['need_mb'] / 1000:.0f} GB needed, {room.get('available_mb', 0) / 1000:.0f} GB there" if room.get("need_mb") else ""))
         silent, theirs = None, {}
         while True:
             if job["status"] != "running":  # cancelled here: cancelled there
@@ -834,15 +905,14 @@ class Hub:
                 return False
             time.sleep(POLL)
         try:
-            if not theirs.get("outputs"):
-                raise LookupError("its job finished without a clip")
-            remote.fetch(base, theirs["outputs"][0], target, timeout=300)
+            for theirs_path, target in pairs(theirs.get("outputs") or [], targets):
+                remote.fetch(base, theirs_path, target, timeout=300)
         except (OSError, LookupError, ValueError) as error:
             self.move(job, worker, f"its clip could not be fetched ({str(error)[-160:]})", down=isinstance(error, OSError))
             return False
         said = [line for line in (theirs.get("log") or "").splitlines() if "[tensorfold]" in line or "[studio]" in line]
         job["log"] = (job["log"] + "\n".join(said[-12:]) + ("\n" if said else ""))[-20000:]
-        say(f"{name} rendered it in {theirs.get('elapsed') or 0:.0f} s; the clip is in this Spark's folder")
+        say(f"{name} rendered it in {theirs.get('elapsed') or 0:.0f} s; " + ("the clip is" if job["kind"] == "video" else "its outputs are") + " in this Spark's folder")
         return job["status"] == "running"
 
     # ---- what a clip was rendered on ----------------------------------------------------------------------------------
@@ -895,7 +965,8 @@ class Hub:
             return {"supported": False, "limit": LIMIT, "chosen": 1, "available": 1, "listed": 1, "used": 1, "mode": "one", "says": MAC, "without": [], "estimate": None}
         able, without = [], []
         for worker in self.workers():
-            why = self.usable(worker) or capable(kind, params, self.state(worker["address"])["info"])
+            why = (self.usable(worker) or capable(kind, params, self.state(worker["address"])["info"])
+                   or self.overflow(worker, kind, max(clips, self.waiting())))
             (without.append({"name": worker.get("name") or worker["address"], "why": why}) if why else able.append(worker["address"]))
         listed, available = 1 + len(able) + len(without), 1 + len(able)
         here = here_only(kind, params)
@@ -909,6 +980,8 @@ class Hub:
             mode, says = "parallel", f"One clip per Spark, {min(used, clips)} at a time: {clips} clips on {min(used, clips)} Sparks."
         else:
             mode, says = "one", f"This clip renders on one Spark, the first that is free of the {used}; other queued clips render beside it. " + ONE_CLIP
+        macs = [name for name, platform in ((worker.get("name") or worker["address"], platform_of(self.state(worker["address"])["info"]))
+                                            for worker in self.workers() if worker["address"] in able[:used - 1]) if platform != "spark"]
         estimate = None
         try:  # one clip's time on one Spark: given, or the app's own measured figure for these settings
             seconds = float(body.get("seconds") or self.timing(kind, params) or 0)
@@ -916,8 +989,11 @@ class Hub:
             seconds = 0
         if seconds > 0:
             faster, measured = speedup(used, clips) if mode == "parallel" else (1.0, True)
+            note = "an estimate from one measured run of 8 clips" + ("" if measured else f"; {used} Sparks were not measured (five exist)")
+            if macs and mode == "parallel":  # the run was on Sparks: a Mac's clip takes its own time
+                measured, note = False, note + "; measured on Sparks only, and " + ", ".join(macs) + " is a Mac, whose clips take longer"
             estimate = {"seconds": int(seconds * clips / faster), "one_spark": int(seconds * clips), "faster": round(faster, 2), "measured": measured,
-                        "note": "an estimate from one measured run of 8 clips" + ("" if measured else f"; {used} Sparks were not measured (five exist)")}
+                        "note": note}
         return {"supported": True, "limit": LIMIT, "chosen": chosen, "available": available, "listed": listed, "used": used, "mode": mode,
                 "count": count, "says": says, "without": without, "estimate": estimate}
 
@@ -975,6 +1051,11 @@ class Hub:
                 raise HTTPException(404, "no such Spark in the list")
             if "enabled" in body:
                 worker["enabled"] = bool(body["enabled"])
+            if "batch" in body:  # clips only in batches of at least this many waiting (None or 0: any clip)
+                try:
+                    worker["batch"] = max(0, min(int(body["batch"] or 0), 1000)) or None
+                except (TypeError, ValueError):
+                    raise HTTPException(400, "batch is a whole number of clips, or 0 for any clip")
             if body.get("name"):
                 worker["name"] = str(body["name"]).strip()[:60]
             if "folder" in body:
@@ -1029,8 +1110,10 @@ class Hub:
         return router
 
 
-def about(home: Path, code: dict, state: dict, loras: list, active: int, memory: dict, models: Path) -> dict:
-    """What an app says of itself on /api/spark/self."""
+def about(home: Path, code: dict, state: dict, loras: list, active: int, memory: dict, installed: dict,
+          image_models: list | None = None) -> dict:
+    """What an app says of itself on /api/spark/self. ``installed``: {"fasth3", "image"}, found where this platform keeps
+    the models (ComfyUI's folders on a Spark, FASTH3_DIR and QWEN_MODEL_DIR on a Mac)."""
 
     try:
         disk = round(shutil.disk_usage(home).free / 1e9, 1)
@@ -1038,7 +1121,6 @@ def about(home: Path, code: dict, state: dict, loras: list, active: int, memory:
         disk = None
     return {"name": socket.gethostname(), "version": state["version"], "platform": state["platform"], "engine": state["engine"],
             "guard": bool(memory), "code": code, "active": active, "memory": memory, "disk_gb": disk,
-            "fasth3": any((models / "FastH3-Comfy/diffusion_models").glob("*fasth3*")),
-            "image": any((models / "Qwen-Image-2.1-Comfy/diffusion_models").glob("qwen_image_2.1*.safetensors")),
+            "fasth3": bool(installed.get("fasth3")), "image": bool(installed.get("image")), "image_models": list(image_models or ["qwen"]) if installed.get("image") else [],
             "ref2va": state["ref2va"], "ref2va_turbo": state["ref2va_turbo"], "ffmpeg": state["ffmpeg"],
             "loras": loras, "text_encoders": state["text_encoders"]}
